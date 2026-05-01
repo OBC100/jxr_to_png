@@ -152,6 +152,9 @@ int write_png_file(FILE *file, png_bytep data, uint32_t width, uint32_t height, 
             PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT
     );
 
+    //png_set_compression_level(png, 9); 9 is much slower than the default of 6, for a very small file size decrease. from 11.7MB to 11.3MB. not worth.
+    //png_set_filter(png, 0, PNG_ALL_FILTERS); //By default, for 16-bit RGB images, libpng already uses PNG_ALL_FILTERS . We are just calling it explicitly to be sure.
+
     uint8_t cicp_data[4] = {9, 16, 0, 1};
 
     uint8_t clli_data[8] = {
