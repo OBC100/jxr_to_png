@@ -12,10 +12,32 @@ This app will scale the luminance of the HDR JXR image by 2.03 and encode to PNG
 
 # Usage
 ```
-jxr_to_png input.jxr [output.png]
+jxr_to_png input.jxr [output.png] [scale_factor]
+```
+or auto-generating the output filename with a scale factor:
+```
+jxr_to_png input.jxr [scale_factor]
 ```
 
-Instead of using the command line, you can also drag a .jxr file onto the executable.
+### Examples:
+- **No scaling:**
+  ```
+  jxr_to_png input.jxr
+  ```
+  *(Generates `input.png`)*
+
+- **Downscale by 2x (e.g. 4K to 1080p):**
+  ```
+  jxr_to_png input.jxr 2
+  ```
+  *(Auto-generates `input_1080p.png` with suffix representing the scaled height)*
+
+- **Downscale by 1.5x (e.g. 4K to 1440p) to a custom output name:**
+  ```
+  jxr_to_png input.jxr output.png 1.5
+  ```
+
+Instead of using the command line, you can also drag a .jxr file onto the executable (uses default 1x scaling).
 
 # HDR metadata
 The MaxCLL value is calculated as suggested in the paper [On the Calculation and Usage of HDR Static Content Metadata](https://doi.org/10.5594/JMI.2021.3090176), by taking the light level of the 99.99 percentile brightest pixel. This is an underestimate of the "real" MaxCLL value calculated according to H.274, so it technically causes some clipping when tone mapping. However, following the spec can lead to a much higher MaxCLL value, which causes e.g. Chromium's tone mapping to significantly dim the entire image, so this trade-off seems to be worth it.

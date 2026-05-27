@@ -7,6 +7,8 @@
 #include <wincodec.h>
 #include <cmath>
 #include <Shlwapi.h>
+#include <string>
+#include <algorithm>
 #include "DirectXMath/DirectXMath.h"
 #include "DirectXMath/DirectXPackedVector.h"
 #include "libpng/png.h"
@@ -206,12 +208,9 @@ int write_png_file(FILE *file, png_bytep data, uint32_t width, uint32_t height, 
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2 && argc != 3) {
-        fprintf(stderr, "jxr_to_png input.jxr [output.png]\n");
-        return 1;
-    }
-
-    LPWSTR inputFile, outputFile;
+    std::wstring inputFile;
+    std::wstring outputFile;
+    double scaleFactor = 1.0;
 
     {
         LPWSTR *szArglist;
@@ -223,26 +222,47 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        inputFile = szArglist[1];
-
-        if (!PathMatchSpecW(inputFile, L"*.jxr")) {
-            fprintf(stderr, "Input must be .jxr file\n");
+        if (nArgs < 2 || nArgs > 4) {
+            fprintf(stderr, "Usage: jxr_to_png input.jxr [output.png] [scale_factor]\n");
+            fprintf(stderr, "   or: jxr_to_png input.jxr [scale_factor]\n");
+            LocalFree(szArglist);
             return 1;
         }
 
-        if (argc == 3) {
+        inputFile = szArglist[1];
+
+        if (!PathMatchSpecW(inputFile.c_str(), L"*.jxr")) {
+            fprintf(stderr, "Input must be .jxr file\n");
+            LocalFree(szArglist);
+            return 1;
+        }
+
+        if (nArgs == 2) {
+            // outputFile will be auto-generated later
+        } else if (nArgs == 3) {
+            // Check if 3rd arg is a scale factor or output file
+            wchar_t *endptr = nullptr;
+            double val = wcstod(szArglist[2], &endptr);
+            if (endptr != szArglist[2] && *endptr == L'\0' && val > 0.0) {
+                scaleFactor = val;
+                // outputFile will be auto-generated later
+            } else {
+                outputFile = szArglist[2];
+            }
+        } else if (nArgs == 4) {
             outputFile = szArglist[2];
-        } else {
-            auto inputName = PathFindFileNameW(inputFile);
-            size_t len = wcslen(inputName);
-            outputFile = (LPWSTR) malloc((len + 1) * sizeof(wchar_t));
-            if (outputFile == nullptr) {
-                fprintf(stderr, "Failed to allocate output name\n");
+            wchar_t *endptr = nullptr;
+            double val = wcstod(szArglist[3], &endptr);
+            if (endptr != szArglist[3] && *endptr == L'\0' && val > 0.0) {
+                scaleFactor = val;
+            } else {
+                fprintf(stderr, "Invalid scale factor: %ls\n", szArglist[3]);
+                LocalFree(szArglist);
                 return 1;
             }
-            memcpy(outputFile, inputName, (len - 3) * sizeof(wchar_t));
-            memcpy(outputFile + len - 3, L"png", 4 * sizeof(wchar_t));
         }
+
+        LocalFree(szArglist);
     }
 
     // Create a decoder
@@ -268,7 +288,7 @@ int main(int argc, char *argv[]) {
     }
 
     hr = pFactory->CreateDecoderFromFilename(
-            inputFile,                       // Image to be decoded
+            inputFile.c_str(),               // Image to be decoded
             nullptr,                            // Do not prefer a particular vendor
             GENERIC_READ,                    // Desired read access to the file
             WICDecodeMetadataCacheOnDemand,  // Cache metadata when needed
@@ -299,6 +319,58 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    uint32_t width, height;
+
+    hr = pBitmapSource->GetSize(&width, &height);
+
+    if (FAILED(hr)) {
+        fprintf(stderr, "Failed to get size\n");
+        return 1;
+    }
+
+    if (scaleFactor != 1.0) {
+        IWICBitmapScaler *pScaler = nullptr;
+        hr = pFactory->CreateBitmapScaler(&pScaler);
+        if (FAILED(hr)) {
+            fprintf(stderr, "Failed to create WIC bitmap scaler\n");
+            return 1;
+        }
+
+        uint32_t newWidth = (std::max)(1u, (uint32_t)round((double)width / scaleFactor));
+        uint32_t newHeight = (std::max)(1u, (uint32_t)round((double)height / scaleFactor));
+
+        printf("Scaling image from %dx%d to %dx%d (factor %g)...\n", width, height, newWidth, newHeight, scaleFactor);
+
+        hr = pScaler->Initialize(pBitmapSource, newWidth, newHeight, WICBitmapInterpolationModeFant);
+        if (FAILED(hr)) {
+            fprintf(stderr, "Failed to initialize WIC bitmap scaler\n");
+            pScaler->Release();
+            return 1;
+        }
+
+        pBitmapSource->Release();
+        hr = pScaler->QueryInterface(IID_IWICBitmapSource, (void **)&pBitmapSource);
+        pScaler->Release();
+        if (FAILED(hr)) {
+            fprintf(stderr, "Failed to query IWICBitmapSource from scaler\n");
+            return 1;
+        }
+
+        width = newWidth;
+        height = newHeight;
+    }
+
+    if (outputFile.empty()) {
+        auto inputName = PathFindFileNameW(inputFile.c_str());
+        size_t len = wcslen(inputName);
+        std::wstring baseName(inputName, len - 4); // "image.jxr" -> "image"
+        if (scaleFactor != 1.0) {
+            outputFile = baseName + L"_" + std::to_wstring(height) + L"p.png";
+        } else {
+            outputFile = baseName + L".png";
+        }
+    }
+
     WICPixelFormatGUID pixelFormat;
 
     hr = pBitmapSource->GetPixelFormat(&pixelFormat);
@@ -310,21 +382,17 @@ int main(int argc, char *argv[]) {
 
     uint8_t bytesPerColor;
 
-    if (IsEqualGUID(pixelFormat, GUID_WICPixelFormat128bppRGBAFloat)) {
+    if (IsEqualGUID(pixelFormat, GUID_WICPixelFormat128bppRGBAFloat) ||
+        IsEqualGUID(pixelFormat, GUID_WICPixelFormat128bppPRGBAFloat)) {
         bytesPerColor = 4;
-    } else if (IsEqualGUID(pixelFormat, GUID_WICPixelFormat64bppRGBAHalf)) {
+    } else if (IsEqualGUID(pixelFormat, GUID_WICPixelFormat64bppRGBAHalf) ||
+               IsEqualGUID(pixelFormat, GUID_WICPixelFormat64bppPRGBAHalf)) {
         bytesPerColor = 2;
     } else {
-        fprintf(stderr, "Unsupported pixel format\n");
-        return 1;
-    }
-
-    uint32_t width, height;
-
-    hr = pBitmapSource->GetSize(&width, &height);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "Failed to get size\n");
+        fprintf(stderr, "Unsupported pixel format: %08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X\n",
+            pixelFormat.Data1, pixelFormat.Data2, pixelFormat.Data3,
+            pixelFormat.Data4[0], pixelFormat.Data4[1], pixelFormat.Data4[2], pixelFormat.Data4[3],
+            pixelFormat.Data4[4], pixelFormat.Data4[5], pixelFormat.Data4[6], pixelFormat.Data4[7]);
         return 1;
     }
 
@@ -369,7 +437,7 @@ int main(int argc, char *argv[]) {
                 pixels);
 
         if (FAILED(hr)) {
-            fprintf(stderr, "Failed to copy pixels\n");
+            fprintf(stderr, "Failed to copy pixels (HRESULT: 0x%08X)\n", hr);
             exit(1);
         }
 
@@ -486,7 +554,7 @@ int main(int argc, char *argv[]) {
 
     printf("Computed HDR metadata: %u MaxCLL, %u MaxFALL\n", maxCLL, maxPALL);
 
-    FILE *f = _wfopen(outputFile, L"wb");
+    FILE *f = _wfopen(outputFile.c_str(), L"wb");
 
     if (!f) {
         perror("Error opening output file");
