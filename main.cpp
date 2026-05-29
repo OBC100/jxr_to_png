@@ -9,6 +9,7 @@
 #include <Shlwapi.h>
 #include <string>
 #include <algorithm>
+#include <vector>
 #include "DirectXMath/DirectXMath.h"
 #include "DirectXMath/DirectXPackedVector.h"
 #include "libpng/png.h"
@@ -38,6 +39,16 @@ inline XMVECTOR pq_inv_eotf(XMVECTOR y) {
             vm2);
 }
 
+inline XMVECTOR linear_to_srgb(XMVECTOR brand_linear) {
+    XMVECTOR cutoff = XMVectorLessOrEqual(brand_linear, XMVectorReplicate(0.0031308f));
+    XMVECTOR low = XMVectorMultiply(brand_linear, XMVectorReplicate(12.92f));
+    XMVECTOR high = XMVectorSubtract(
+        XMVectorMultiply(XMVectorReplicate(1.055f), XMVectorPow(brand_linear, XMVectorReplicate(1.0f / 2.4f))),
+        XMVectorReplicate(0.055f)
+    );
+    return XMVectorSelect(high, low, cutoff);
+}
+
 static const XMMATRIX scrgb_to_bt2100 = {
         {2939026994.L / 585553224375.L,  76515593.L / 138420033750.L,   12225392.L / 93230009375.L,      0},
         {9255011753.L / 3513319346250.L, 6109575001.L / 830520202500.L, 1772384008.L / 2517210253125.L,  0},
@@ -56,6 +67,7 @@ typedef struct ThreadData {
 #endif
     uint16_t maxNits;
     uint8_t bytesPerColor;
+    bool isSdr;
 } ThreadData;
 
 DWORD WINAPI ThreadFunc(LPVOID lpParam) {
@@ -80,12 +92,17 @@ DWORD WINAPI ThreadFunc(LPVOID lpParam) {
                 v = XMLoadHalf4((XMHALF4 * )((HALF *) pixels + i * 4 * width + 4 * j));
             }
 
-            //   scale linearly by 2.03. this is because apps like Chrome and
-            //   Lightroom normalise HDR photo exposure by dividing by 203 nits, then
-            //   multiplying by device SDR brightness (I use 100 nits)
-            v = XMVectorMultiply(v, XMVectorReplicate(2.03f));
+            if (d->isSdr) {
+                v = XMVectorClamp(XMVectorMultiply(v, XMVectorReplicate(0.8f)), g_XMZero, g_XMOne);
+                v = linear_to_srgb(v);
+            } else {
+                //   scale linearly by 2.03. this is because apps like Chrome and
+                //   Lightroom normalise HDR photo exposure by dividing by 203 nits, then
+                //   multiplying by device SDR brightness (I use 100 nits)
+                v = XMVectorMultiply(v, XMVectorReplicate(2.03f));
 
-            v = XMVectorSaturate(XMVector3Transform(v, scrgb_to_bt2100));
+                v = XMVectorSaturate(XMVector3Transform(v, scrgb_to_bt2100));
+            }
 
             auto bt2020 = XMFLOAT4A();
 
@@ -94,8 +111,10 @@ DWORD WINAPI ThreadFunc(LPVOID lpParam) {
             float maxComp = max(bt2020.x, max(bt2020.y, bt2020.z));
 
 #ifdef MAXCLL_PERCENTILE
-            auto nits = (uint32_t) roundf(maxComp * 10000);
-            d->nitCounts[nits]++;
+            if (!d->isSdr && d->nitCounts) {
+                auto nits = (uint32_t) roundf(maxComp * 10000);
+                d->nitCounts[nits]++;
+            }
 #endif
             if (maxComp > maxMaxComp) {
                 maxMaxComp = maxComp;
@@ -103,11 +122,14 @@ DWORD WINAPI ThreadFunc(LPVOID lpParam) {
 
             sumOfMaxComp += maxComp;
 
-            const auto maxTarget = (float) ((1 << TARGET_BITS) - 1);
-
-            __m128i vint = _mm_cvtps_epi32(XMVectorMultiply(pq_inv_eotf(v), XMVectorReplicate(maxTarget)));
-
-            vint = _mm_slli_epi32(vint, INTERMEDIATE_BITS - TARGET_BITS);
+            __m128i vint;
+            if (d->isSdr) {
+                vint = _mm_cvtps_epi32(XMVectorMultiply(v, XMVectorReplicate(65535.0f)));
+            } else {
+                const auto maxTarget = (float) ((1 << TARGET_BITS) - 1);
+                vint = _mm_cvtps_epi32(XMVectorMultiply(pq_inv_eotf(v), XMVectorReplicate(maxTarget)));
+                vint = _mm_slli_epi32(vint, INTERMEDIATE_BITS - TARGET_BITS);
+            }
 
             __m128i vshort = _mm_packus_epi32(vint, vint);
 
@@ -129,7 +151,7 @@ DWORD WINAPI ThreadFunc(LPVOID lpParam) {
     return 0;
 }
 
-int write_png_file(FILE *file, png_bytep data, uint32_t width, uint32_t height, uint32_t maxCLL, uint32_t maxFALL) {
+int write_png_file(FILE *file, png_bytep data, uint32_t width, uint32_t height, uint32_t maxCLL, uint32_t maxFALL, bool isSdr) {
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
     if (!png) {
         fprintf(stderr, "Could not create PNG write struct\n");
@@ -157,37 +179,44 @@ int write_png_file(FILE *file, png_bytep data, uint32_t width, uint32_t height, 
     //png_set_compression_level(png, 9); 9 is much slower than the default of 6, for a very small file size decrease. from 11.7MB to 11.3MB. not worth.
     //png_set_filter(png, 0, PNG_ALL_FILTERS); //By default, for 16-bit RGB images, libpng already uses PNG_ALL_FILTERS . We are just calling it explicitly to be sure.
 
-    uint8_t cicp_data[4] = {9, 16, 0, 1};
+    if (isSdr) {
+        png_set_sRGB_gAMA_and_cHRM(png, info, PNG_sRGB_INTENT_RELATIVE);
 
-    uint8_t clli_data[8] = {
-            (uint8_t) ((maxCLL >> 24) & 0xFF),
-            (uint8_t) ((maxCLL >> 16) & 0xFF),
-            (uint8_t) ((maxCLL >> 8) & 0xFF),
-            (uint8_t) (maxCLL & 0xFF),
-            (uint8_t) ((maxFALL >> 24) & 0xFF),
-            (uint8_t) ((maxFALL >> 16) & 0xFF),
-            (uint8_t) ((maxFALL >> 8) & 0xFF),
-            (uint8_t) (maxFALL & 0xFF),
-    };
+        png_color_8 sig_bit = {.red = 16, .green = 16, .blue = 16};
+        png_set_sBIT(png, info, &sig_bit);
+    } else {
+        uint8_t cicp_data[4] = {9, 16, 0, 1};
 
-    png_unknown_chunk unknown_chunks[] = {
-            {.name = {'c', 'I', 'C', 'P'}, .data = cicp_data, .size = 4, .location = PNG_HAVE_IHDR},
-            {.name = {'c', 'L', 'L', 'i'}, .data = clli_data, .size = 8, .location = PNG_HAVE_IHDR}
-    };
+        uint8_t clli_data[8] = {
+                (uint8_t) ((maxCLL >> 24) & 0xFF),
+                (uint8_t) ((maxCLL >> 16) & 0xFF),
+                (uint8_t) ((maxCLL >> 8) & 0xFF),
+                (uint8_t) (maxCLL & 0xFF),
+                (uint8_t) ((maxFALL >> 24) & 0xFF),
+                (uint8_t) ((maxFALL >> 16) & 0xFF),
+                (uint8_t) ((maxFALL >> 8) & 0xFF),
+                (uint8_t) (maxFALL & 0xFF),
+        };
 
-    int num_unknowns = sizeof(unknown_chunks) / sizeof(unknown_chunks[0]);
+        png_unknown_chunk unknown_chunks[] = {
+                {.name = {'c', 'I', 'C', 'P'}, .data = cicp_data, .size = 4, .location = PNG_HAVE_IHDR},
+                {.name = {'c', 'L', 'L', 'i'}, .data = clli_data, .size = 8, .location = PNG_HAVE_IHDR}
+        };
 
-    for (int i = 0; i < num_unknowns; i++) {
-        png_set_keep_unknown_chunks(png, PNG_HANDLE_CHUNK_ALWAYS, unknown_chunks[i].name, 1);
-        png_set_unknown_chunks(png, info, &unknown_chunks[i], 1);
+        int num_unknowns = sizeof(unknown_chunks) / sizeof(unknown_chunks[0]);
+
+        for (int i = 0; i < num_unknowns; i++) {
+            png_set_keep_unknown_chunks(png, PNG_HANDLE_CHUNK_ALWAYS, unknown_chunks[i].name, 1);
+            png_set_unknown_chunks(png, info, &unknown_chunks[i], 1);
+        }
+
+        png_set_iCCP(png, info, icc_name, PNG_COMPRESSION_TYPE_BASE, icc_data, sizeof(icc_data));
+
+        png_set_cHRM_fixed(png, info, 31270, 32900, 70800, 29200, 17000, 79700, 13100, 4600);
+
+        png_color_8 sig_bit = {.red = TARGET_BITS, .green = TARGET_BITS, .blue = TARGET_BITS};
+        png_set_sBIT(png, info, &sig_bit);
     }
-
-    png_set_iCCP(png, info, icc_name, PNG_COMPRESSION_TYPE_BASE, icc_data, sizeof(icc_data));
-
-    png_set_cHRM_fixed(png, info, 31270, 32900, 70800, 29200, 17000, 79700, 13100, 4600);
-
-    png_color_8 sig_bit = {.red = TARGET_BITS, .green = TARGET_BITS, .blue = TARGET_BITS};
-    png_set_sBIT(png, info, &sig_bit);
 
     png_write_info(png, info);
 
@@ -208,6 +237,7 @@ int write_png_file(FILE *file, png_bytep data, uint32_t width, uint32_t height, 
 }
 
 int main(int argc, char *argv[]) {
+    bool isSdr = false;
     std::wstring inputFile;
     std::wstring outputFile;
     double scaleFactor = 1.0;
@@ -222,14 +252,25 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        if (nArgs < 2 || nArgs > 4) {
-            fprintf(stderr, "Usage: jxr_to_png input.jxr [output.png] [scale_factor]\n");
-            fprintf(stderr, "   or: jxr_to_png input.jxr [scale_factor]\n");
+        std::vector<std::wstring> positionalArgs;
+        for (int i = 1; i < nArgs; i++) {
+            std::wstring arg = szArglist[i];
+            if (arg == L"sdr" || arg == L"-sdr" || arg == L"--sdr" ||
+                arg == L"SDR" || arg == L"-SDR" || arg == L"--SDR") {
+                isSdr = true;
+            } else {
+                positionalArgs.push_back(arg);
+            }
+        }
+
+        if (positionalArgs.size() < 1 || positionalArgs.size() > 3) {
+            fprintf(stderr, "Usage: jxr_to_png input.jxr [output.png] [scale_factor] [sdr]\n");
+            fprintf(stderr, "   or: jxr_to_png input.jxr [scale_factor] [sdr]\n");
             LocalFree(szArglist);
             return 1;
         }
 
-        inputFile = szArglist[1];
+        inputFile = positionalArgs[0];
 
         if (!PathMatchSpecW(inputFile.c_str(), L"*.jxr")) {
             fprintf(stderr, "Input must be .jxr file\n");
@@ -237,26 +278,22 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        if (nArgs == 2) {
-            // outputFile will be auto-generated later
-        } else if (nArgs == 3) {
-            // Check if 3rd arg is a scale factor or output file
+        if (positionalArgs.size() == 2) {
             wchar_t *endptr = nullptr;
-            double val = wcstod(szArglist[2], &endptr);
-            if (endptr != szArglist[2] && *endptr == L'\0' && val > 0.0) {
+            double val = wcstod(positionalArgs[1].c_str(), &endptr);
+            if (endptr != positionalArgs[1].c_str() && *endptr == L'\0' && val > 0.0) {
                 scaleFactor = val;
-                // outputFile will be auto-generated later
             } else {
-                outputFile = szArglist[2];
+                outputFile = positionalArgs[1];
             }
-        } else if (nArgs == 4) {
-            outputFile = szArglist[2];
+        } else if (positionalArgs.size() == 3) {
+            outputFile = positionalArgs[1];
             wchar_t *endptr = nullptr;
-            double val = wcstod(szArglist[3], &endptr);
-            if (endptr != szArglist[3] && *endptr == L'\0' && val > 0.0) {
+            double val = wcstod(positionalArgs[2].c_str(), &endptr);
+            if (endptr != positionalArgs[2].c_str() && *endptr == L'\0' && val > 0.0) {
                 scaleFactor = val;
             } else {
-                fprintf(stderr, "Invalid scale factor: %ls\n", szArglist[3]);
+                fprintf(stderr, "Invalid scale factor: %ls\n", positionalArgs[2].c_str());
                 LocalFree(szArglist);
                 return 1;
             }
@@ -364,10 +401,11 @@ int main(int argc, char *argv[]) {
         auto inputName = PathFindFileNameW(inputFile.c_str());
         size_t len = wcslen(inputName);
         std::wstring baseName(inputName, len - 4); // "image.jxr" -> "image"
+        std::wstring suffix = isSdr ? L"_sdr.png" : L".png";
         if (scaleFactor != 1.0) {
-            outputFile = baseName + L"_" + std::to_wstring(height) + L"p.png";
+            outputFile = baseName + L"_" + std::to_wstring(height) + L"p" + suffix;
         } else {
-            outputFile = baseName + L".png";
+            outputFile = baseName + suffix;
         }
     }
 
@@ -409,9 +447,13 @@ int main(int argc, char *argv[]) {
     uint32_t numThreads = min(8, systemInfo.dwNumberOfProcessors / 2);
     printf("Using %d threads\n", numThreads);
 
-    puts("Converting pixels to BT.2100 PQ...");
+    if (isSdr) {
+        puts("Converting pixels to SDR sRGB...");
+    } else {
+        puts("Converting pixels to BT.2100 PQ...");
+    }
 
-    uint16_t maxCLL, maxPALL;
+    uint16_t maxCLL = 0, maxPALL = 0;
 
     {
 
@@ -476,9 +518,14 @@ int main(int argc, char *argv[]) {
             } else {
                 threadData[i]->stop = height;
             }
+            threadData[i]->isSdr = isSdr;
 
 #ifdef MAXCLL_PERCENTILE
-            threadData[i]->nitCounts = (uint32_t *) calloc(10000, sizeof(uint32_t));
+            if (!isSdr) {
+                threadData[i]->nitCounts = (uint32_t *) calloc(10000, sizeof(uint32_t));
+            } else {
+                threadData[i]->nitCounts = nullptr;
+            }
 #endif
 
             HANDLE hThread = CreateThread(
@@ -521,24 +568,28 @@ int main(int argc, char *argv[]) {
         }
 
 #ifdef MAXCLL_PERCENTILE
-        uint16_t currentIdx = maxCLL;
-        uint64_t count = 0;
-        auto countTarget = (uint64_t) round((1 - MAXCLL_PERCENTILE) * (double) ((uint64_t) width * height));
-        while (true) {
-            for (uint32_t i = 0; i < convThreads; i++) {
-                count += threadData[i]->nitCounts[currentIdx];
+        if (!isSdr) {
+            uint16_t currentIdx = maxCLL;
+            uint64_t count = 0;
+            auto countTarget = (uint64_t) round((1 - MAXCLL_PERCENTILE) * (double) ((uint64_t) width * height));
+            while (true) {
+                for (uint32_t i = 0; i < convThreads; i++) {
+                    count += threadData[i]->nitCounts[currentIdx];
+                }
+                if (count >= countTarget) {
+                    maxCLL = currentIdx;
+                    break;
+                }
+                currentIdx--;
             }
-            if (count >= countTarget) {
-                maxCLL = currentIdx;
-                break;
-            }
-            currentIdx--;
         }
 #endif
 
         for (uint32_t i = 0; i < convThreads; i++) {
 #ifdef MAXCLL_PERCENTILE
-            free(threadData[i]->nitCounts);
+            if (threadData[i]->nitCounts != nullptr) {
+                free(threadData[i]->nitCounts);
+            }
 #endif
             free(threadData[i]);
         }
@@ -547,12 +598,16 @@ int main(int argc, char *argv[]) {
         free(threadData);
         free(dwThreadIdArray);
 
-        maxPALL = (uint16_t) round(10000 * (sumOfMaxComp / (double) ((uint64_t) width * height)));
+        if (!isSdr) {
+            maxPALL = (uint16_t) round(10000 * (sumOfMaxComp / (double) ((uint64_t) width * height)));
+        }
 
         free(pixels);
     }
 
-    printf("Computed HDR metadata: %u MaxCLL, %u MaxFALL\n", maxCLL, maxPALL);
+    if (!isSdr) {
+        printf("Computed HDR metadata: %u MaxCLL, %u MaxFALL\n", maxCLL, maxPALL);
+    }
 
     FILE *f = _wfopen(outputFile.c_str(), L"wb");
 
@@ -565,7 +620,7 @@ int main(int argc, char *argv[]) {
     uint32_t maxFALL_png = maxPALL * 10000;
 
     printf("Doing PNG encoding...\n");
-    if (write_png_file(f, (unsigned char *) converted, width, height, maxCLL_png, maxFALL_png)) {
+    if (write_png_file(f, (unsigned char *) converted, width, height, maxCLL_png, maxFALL_png, isSdr)) {
         printf("Error on PNG encode\n");
         return 1;
     }

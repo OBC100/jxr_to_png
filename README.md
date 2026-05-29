@@ -12,11 +12,11 @@ This app will scale the luminance of the HDR JXR image by 2.03 and encode to PNG
 
 # Usage
 ```
-jxr_to_png input.jxr [output.png] [scale_factor]
+jxr_to_png input.jxr [output.png] [scale_factor] [sdr]
 ```
-or auto-generating the output filename with a scale factor:
+or auto-generating the output filename with a scale factor or SDR flag:
 ```
-jxr_to_png input.jxr [scale_factor]
+jxr_to_png input.jxr [scale_factor] [sdr]
 ```
 
 ### Examples:
@@ -26,11 +26,23 @@ jxr_to_png input.jxr [scale_factor]
   ```
   *(Generates `input.png`)*
 
+- **SDR conversion:**
+  ```
+  jxr_to_png input.jxr sdr
+  ```
+  *(Converts the linear JXR image to standard SDR, clipping at 100 nits, and auto-generates `input_sdr.png`)*
+
 - **Downscale by 2x (e.g. 4K to 1080p):**
   ```
   jxr_to_png input.jxr 2
   ```
   *(Auto-generates `input_1080p.png` with suffix representing the scaled height)*
+
+- **Downscale by 2x and convert to SDR:**
+  ```
+  jxr_to_png input.jxr 2 sdr
+  ```
+  *(Downscales by 2x, converts to SDR, and auto-generates `input_1080p_sdr.png`)*
 
 - **Downscale by 1.5x (e.g. 4K to 1440p) to a custom output name:**
   ```
