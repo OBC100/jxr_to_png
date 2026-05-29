@@ -4,7 +4,9 @@
 # About
 This is a simple command line tool for converting HDR JPEG XR files, such as Windows HDR screenshots, to PNG.
 
-The output format is 16 bit PNG with BT.2100 + PQ color space, but the actual data is quantized to 10 bits to try to keep the size reasonably low. The files should display properly in any Chromium-based browser, which includes Electron apps like the desktop version of Discord.
+By default, the output format is 16-bit PNG with BT.2100 + PQ color space, with the actual data quantized to 10 bits to keep the file size reasonably low. The files should display properly in any Chromium-based browser (including Electron apps like Discord).
+
+If the `sdr` flag is passed, the tool converts the linear JXR image to standard SDR, clipping at 100 nits, and outputs a 16-bit sRGB PNG with full 16-bit precision.
 
 # Notes:
 
