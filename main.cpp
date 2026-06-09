@@ -398,14 +398,22 @@ int main(int argc, char *argv[]) {
     }
 
     if (outputFile.empty()) {
+        std::wstring dirPath = inputFile;
+        size_t lastSlash = dirPath.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            dirPath = dirPath.substr(0, lastSlash + 1);
+        } else {
+            dirPath = L"";
+        }
+
         auto inputName = PathFindFileNameW(inputFile.c_str());
         size_t len = wcslen(inputName);
         std::wstring baseName(inputName, len - 4); // "image.jxr" -> "image"
         std::wstring suffix = isSdr ? L"_sdr.png" : L".png";
         if (scaleFactor != 1.0) {
-            outputFile = baseName + L"_" + std::to_wstring(height) + L"p" + suffix;
+            outputFile = dirPath + baseName + L"_" + std::to_wstring(height) + L"p" + suffix;
         } else {
-            outputFile = baseName + suffix;
+            outputFile = dirPath + baseName + suffix;
         }
     }
 
