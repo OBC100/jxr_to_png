@@ -625,5 +625,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Encode success: %.2f MB\n", (double)ftell(f) / (1024.0 * 1024.0));
+    printf("Encode success: %.2f MB\n\n", (double)ftell(f) / (1024.0 * 1024.0));
 }
+
