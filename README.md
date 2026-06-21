@@ -8,10 +8,6 @@ By default, the output format is 16-bit PNG with BT.2100 + PQ color space, with 
 
 If the `sdr` flag is passed, the tool converts the linear JXR image to standard SDR, clipping at 100 nits, and outputs a 16-bit sRGB PNG with full 16-bit precision.
 
-# Notes:
-
-This app will scale the luminance of the HDR JXR image by 2.03 and encode to PNG PQ BT2020. This is because apps like Chrome and Lightroom normalise HDR photo exposure by dividing by 203 nits, then multiplying by device SDR brightness (I use 100 nits).
-
 # Usage
 ```
 jxr_to_png input.jxr [output.png] [scale_factor] [sdr]
